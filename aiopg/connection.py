@@ -765,6 +765,8 @@ class Connection:
         self._timeout = timeout
         self._last_usage = self._loop.time()
         self._writing = False
+        self._reading = True
+        self._conn_established = False
         self._echo = echo
         self._notifies = asyncio.Queue()  # type: ignore
         self._notifies_proxy = ClosableQueue(self._notifies, self._loop)
@@ -782,6 +784,15 @@ class Connection:
         if self is None:
             return
 
+        # during connection establishment libpq can close and change the socket
+        # under us, re-add the event to cope
+        if not self._conn_established and self._writing:
+            self._loop.remove_writer(self._conn.fileno())
+            self._writing = False
+        if not self._conn_established and self._reading:
+            self._loop.remove_reader(self._conn.fileno())
+            self._reading = False
+
         waiter = self._waiter
 
         try:
@@ -790,22 +801,23 @@ class Connection:
                 notify = self._conn.notifies.pop(0)
                 self._notifies.put_nowait(notify)
         except (psycopg2.Warning, psycopg2.Error) as exc:
-            if self._fileno is not None:
+            if self._conn.fileno() is not None:
                 try:
-                    select.select([self._fileno], [], [], 0)
+                    select.select([self._conn.fileno()], [], [], 0)
                 except OSError as os_exc:
                     if _is_bad_descriptor_error(os_exc):
                         with contextlib.suppress(OSError):
-                            self._loop.remove_reader(self._fileno)
+                            print("removing reader cos error {}".format(exc));
+                            self._loop.remove_reader(self._conn.fileno())
                             # forget a bad file descriptor, don't try to
                             # touch it
-                            self._fileno = None
+                            # self._conn.fileno() = None
 
             try:
                 if self._writing:
                     self._writing = False
-                    if self._fileno is not None:
-                        self._loop.remove_writer(self._fileno)
+                    if self._conn.fileno() is not None:
+                        self._loop.remove_writer(self._conn.fileno())
             except OSError as exc2:
                 if exc2.errno != errno.EBADF:
                     # EBADF is ok for closed file descriptor
@@ -816,26 +828,35 @@ class Connection:
             if waiter is not None and not waiter.done():
                 waiter.set_exception(exc)
         else:
-            if self._fileno is None:
+            if self._conn.fileno() is None:
                 # connection closed
                 if waiter is not None and not waiter.done():
                     waiter.set_exception(
                         psycopg2.OperationalError("Connection closed")
                     )
             if state == psycopg2.extensions.POLL_OK:
-                if self._writing:
-                    self._loop.remove_writer(self._fileno)  # type: ignore
-                    self._writing = False
+                if not self._reading:
+                    self._loop.add_reader(
+                            self._conn.fileno(), self._ready, weak_self  # type: ignore
+                        )
+                    self._reading = True
+                self._conn_established = True
                 if waiter is not None and not waiter.done():
                     waiter.set_result(None)
             elif state == psycopg2.extensions.POLL_READ:
                 if self._writing:
-                    self._loop.remove_writer(self._fileno)  # type: ignore
+                    self._loop.remove_writer(self._conn.fileno())
                     self._writing = False
+                if not self._reading:
+                    self._loop.add_reader(
+                            self._conn.fileno(), self._ready, weak_self  # type: ignore
+                        )
+                self._reading = True
             elif state == psycopg2.extensions.POLL_WRITE:
                 if not self._writing:
+                    print("adding writer {}", self._conn.fileno())
                     self._loop.add_writer(
-                        self._fileno, self._ready, weak_self  # type: ignore
+                        self._conn.fileno(), self._ready, weak_self  # type: ignore
                     )
                     self._writing = True
             elif state == psycopg2.extensions.POLL_ERROR:
@@ -973,13 +994,16 @@ class Connection:
         """Remove the connection from the event_loop and close it."""
         # N.B. If connection contains uncommitted transaction the
         # transaction will be discarded
-        if self._fileno is not None:
-            self._loop.remove_reader(self._fileno)
+        if self._conn.fileno() is not None:
+            if self._reading:
+                self._reading = False
+                self._loop.remove_reader(self._conn.fileno())
             if self._writing:
                 self._writing = False
-                self._loop.remove_writer(self._fileno)
+                self._loop.remove_writer(self._conn.fileno())
 
         self._conn.close()
+        self._conn_established = False
 
         if not self._loop.is_closed():
             if self._waiter is not None and not self._waiter.done():
